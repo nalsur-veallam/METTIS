@@ -1,0 +1,7 @@
+intrinsic value           306.20
+grid value                685.201    81^2 nodes, 21 s
+tensor train value        687.638    eps 1e-05, max rank 25, 192 s
+lower bound (TT policy)   685.125 +- 0.542    40000 paths, 22 s
+exact policy, same paths  685.143 +- 0.542    difference 0.019, 891 s
+upper bound               685.387 +- 0.023    4000 paths, 6 s
+gap                       0.038 %

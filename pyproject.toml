@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mettis"
+version = "0.1.0"
+description = "Multi-factor Exercise via Tensor-Train Inventory Solver"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Ruslan Mallaev"}]
+dependencies = ["numpy", "teneva"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["mettis*"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+extend-select = ["I"]
