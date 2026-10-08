@@ -3,11 +3,13 @@
 from mettis.bounds import lower_bound, upper_bound
 from mettis.prices import FORWARD_CURVE, Factor, PriceModel, bdj_factors
 from mettis.solvers import Solution, intrinsic_value, solve_grid, solve_tt
-from mettis.storage import Storage
+from mettis.storage import Link, Network, Storage
 
 __all__ = [
     "FORWARD_CURVE",
     "Factor",
+    "Link",
+    "Network",
     "PriceModel",
     "Solution",
     "Storage",

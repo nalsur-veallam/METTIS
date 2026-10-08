@@ -1,6 +1,7 @@
-"""Gas storage contract"""
+"""Gas storages, transport links between hubs and networks of both"""
 
 from dataclasses import dataclass
+from itertools import product
 
 import numpy as np
 
@@ -65,3 +66,128 @@ class Storage:
             self.start + self.max_injection * t,
         )
         return low, high
+
+
+@dataclass(frozen=True)
+class Link:
+    """Transport capacity between two hubs
+
+    A flow f > 0 buys f units at the source hub and sells them at the target hub,
+    f < 0 transports in the other direction. The cash flow is
+    f (S_target - S_source) - tariff |f|.
+
+    Attributes
+    ----------
+    source: int
+        Index of the source hub
+    target: int
+        Index of the target hub
+    capacity: int
+        Units per day in each direction
+    tariff: float, default=0.0
+        Cost per unit transported
+    """
+
+    source: int
+    target: int
+    capacity: int
+    tariff: float = 0.0
+
+
+class Network:
+    """Storages at hubs connected by links
+
+    Every storage trades at its hub. The net quantity sold at hub h on a day,
+    sum of the withdrawals of storages at h plus the flows arriving at h minus the
+    flows leaving h, can be limited by hub_capacity[h]. Such a limit makes storages
+    and links compete for the hub, so the joint problem does not split into
+    independent single-storage problems.
+
+    Attributes
+    ----------
+    storages: list[Storage]
+        Storages, all with the same number of days and discount factor
+    hubs: list[int]
+        Hub of each storage
+    links: list[Link]
+        Transport links
+    hub_capacity: list[int | None]
+        Limit on the net daily quantity sold or bought at each hub, None for no limit
+    actions: np.ndarray
+        Admissible joint actions of the storages, shape (n_actions, n_storages)
+    flows: np.ndarray
+        Link flows of the same joint actions, shape (n_actions, n_links)
+    """
+
+    def __init__(
+        self,
+        storages: list[Storage],
+        hubs: list[int] | None = None,
+        links: list[Link] | None = None,
+        hub_capacity: list[int | None] | None = None,
+    ) -> None:
+        self.storages = storages
+        self.hubs = hubs if hubs is not None else [0] * len(storages)
+        self.links = links if links is not None else []
+        n_hubs = 1 + max(
+            self.hubs
+            + [link.source for link in self.links]
+            + [link.target for link in self.links]
+        )
+        self.hub_capacity = (
+            hub_capacity if hub_capacity is not None else [None] * n_hubs
+        )
+
+        self.n_storages = len(storages)
+        self.n_days = storages[0].n_days
+        self.discount = storages[0].discount
+        for storage in storages:
+            assert storage.n_days == self.n_days and storage.discount == self.discount
+
+        self.actions, self.flows = self._joint_actions()
+
+    @staticmethod
+    def single(storage: Storage) -> "Network":
+        return Network([storage])
+
+    def _joint_actions(self) -> tuple[np.ndarray, np.ndarray]:
+        moves = [storage.actions() for storage in self.storages]
+        flows = [range(-link.capacity, link.capacity + 1) for link in self.links]
+
+        actions, link_flows = [], []
+        for combination in product(*moves, *flows):
+            a, f = combination[: self.n_storages], combination[self.n_storages :]
+            if self._within_hub_capacity(a, f):
+                actions.append(a)
+                link_flows.append(f)
+        n_actions = len(actions)
+        actions = np.array(actions, dtype=int).reshape(n_actions, self.n_storages)
+        link_flows = np.array(link_flows, dtype=int).reshape(n_actions, len(self.links))
+        return actions, link_flows
+
+    def _within_hub_capacity(self, a: tuple, f: tuple) -> bool:
+        for h, capacity in enumerate(self.hub_capacity):
+            if capacity is None:
+                continue
+            net = sum(a_j for a_j, hub in zip(a, self.hubs) if hub == h)
+            net += sum(f_l for f_l, link in zip(f, self.links) if link.target == h)
+            net -= sum(f_l for f_l, link in zip(f, self.links) if link.source == h)
+            if abs(net) > capacity:
+                return False
+        return True
+
+    def cash(self, i: int, spots: list) -> np.ndarray:
+        """Cash flow of joint action i for spot prices spots[h] at each hub"""
+        total = 0.0
+        for j, (storage, hub) in enumerate(zip(self.storages, self.hubs)):
+            total = total + storage.cash(self.actions[i, j], spots[hub])
+        for k, link in enumerate(self.links):
+            f = self.flows[i, k]
+            if f != 0:
+                total = total + f * (spots[link.target] - spots[link.source])
+                total = total - link.tariff * abs(f)
+        return total
+
+    def levels(self, t: int) -> list[tuple[int, int]]:
+        """Lowest and highest inventory of every storage at day t"""
+        return [storage.levels(t) for storage in self.storages]

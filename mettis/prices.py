@@ -1,4 +1,7 @@
-"""Factor model for the spot price of the Boogert and de Jong (2011) benchmark"""
+"""Factor model for spot prices at one or several hubs
+
+The default forward curve is the one of the Boogert and de Jong (2011) benchmark.
+"""
 
 from dataclasses import dataclass
 
@@ -15,7 +18,7 @@ FEBRUARY_FIRST = 306
 
 @dataclass(frozen=True)
 class Factor:
-    """Factor of the log spot price
+    """Factor of the log spot prices
 
     Attributes
     ----------
@@ -24,12 +27,16 @@ class Factor:
     sigma: float
         Daily volatility
     seasonal: bool, default=False
-        Use the winter-summer loading 0.5 cos(2 pi (t - 1 Feb) / 365.25) instead of 1
+        Multiply the loading by 0.5 cos(2 pi (t - 1 Feb) / 365.25)
+    hub_loadings: tuple[float, ...], default=None
+        Loading of the factor at each hub, None means 1 at every hub. A factor with
+        loadings (0, 1) moves only the second hub, that is the spread between the hubs.
     """
 
     kappa: float
     sigma: float
     seasonal: bool = False
+    hub_loadings: tuple[float, ...] | None = None
 
 
 def bdj_factors(n_factors: int) -> list[Factor]:
@@ -45,33 +52,38 @@ def bdj_factors(n_factors: int) -> list[Factor]:
 
 
 class PriceModel:
-    """Spot price driven by independent factors
+    """Spot prices at one or several hubs driven by independent factors
 
     x_k(t + 1) = (1 - kappa_k) x_k(t) + sigma_k eps_k(t + 1)
-    ln S(t) = ln F(t) + sum_k lambda_k(t) x_k(t) - Var[sum_k lambda_k(t) x_k(t)] / 2
+    ln S_h(t) = ln F_h(t) + sum_k lambda_hk(t) x_k(t) - Var[sum_k lambda_hk(t) x_k(t)] / 2
 
-    The variance term makes E[S(t)] = F(t).
+    The variance term makes E[S_h(t)] = F_h(t).
 
     Attributes
     ----------
     factors: list[Factor]
         Factors of the model
     forward: np.ndarray
-        Forward curve F(t), one price per day
+        Forward curves F_h(t) of shape (n_hubs, n_days)
     """
 
     def __init__(
         self, factors: list[Factor], forward: np.ndarray = FORWARD_CURVE
     ) -> None:
         self.factors = factors
-        self.forward = np.asarray(forward, dtype=float)
-        self.n_days = len(self.forward)
+        self.forward = np.atleast_2d(np.asarray(forward, dtype=float))
+        self.n_hubs, self.n_days = self.forward.shape
         self.n_factors = len(factors)
+        for factor in factors:
+            if factor.hub_loadings is not None:
+                assert len(factor.hub_loadings) == self.n_hubs
 
-    def loading(self, k: int, t: int) -> float:
-        if self.factors[k].seasonal:
-            return 0.5 * np.cos(2 * np.pi * (t - FEBRUARY_FIRST) / 365.25)
-        return 1.0
+    def loading(self, k: int, t: int, hub: int = 0) -> float:
+        factor = self.factors[k]
+        value = 1.0 if factor.hub_loadings is None else factor.hub_loadings[hub]
+        if factor.seasonal:
+            value *= 0.5 * np.cos(2 * np.pi * (t - FEBRUARY_FIRST) / 365.25)
+        return value
 
     def variance(self, k: int, t: int) -> float:
         """Variance of factor k at day t, the factor starts at zero"""
@@ -81,22 +93,23 @@ class PriceModel:
             return sigma**2 * t
         return sigma**2 * (1.0 - a ** (2 * t)) / (1.0 - a**2)
 
-    def log_shift(self, t: int) -> float:
+    def log_shift(self, t: int, hub: int = 0) -> float:
         return -0.5 * sum(
-            self.loading(k, t) ** 2 * self.variance(k, t) for k in range(self.n_factors)
+            self.loading(k, t, hub) ** 2 * self.variance(k, t)
+            for k in range(self.n_factors)
         )
 
-    def spot(self, t: int, x: np.ndarray) -> np.ndarray:
+    def spot(self, t: int, x: np.ndarray, hub: int = 0) -> np.ndarray:
         """Spot price at day t for factor values x of shape (n_points, n_factors)"""
-        z = sum(self.loading(k, t) * x[:, k] for k in range(self.n_factors))
-        return self.forward[t] * np.exp(self.log_shift(t) + z)
+        z = sum(self.loading(k, t, hub) * x[:, k] for k in range(self.n_factors))
+        return self.forward[hub, t] * np.exp(self.log_shift(t, hub) + z)
 
     def spot_on_grid(
-        self, t: int, grids: list[np.ndarray]
+        self, t: int, grids: list[np.ndarray], hub: int = 0
     ) -> tuple[float, list[np.ndarray]]:
         """Spot price on a grid as S[i_1, ..., i_d] = base prod_k parts[k][i_k]"""
-        base = self.forward[t] * np.exp(self.log_shift(t))
-        parts = [np.exp(self.loading(k, t) * grid) for k, grid in enumerate(grids)]
+        base = self.forward[hub, t] * np.exp(self.log_shift(t, hub))
+        parts = [np.exp(self.loading(k, t, hub) * g) for k, g in enumerate(grids)]
         return base, parts
 
     def grids(self, n_nodes: int, n_std: float = 5.0) -> list[np.ndarray]:
@@ -119,7 +132,7 @@ class PriceModel:
         x: np.ndarray
             Factor values of shape (n_days, n_paths, n_factors)
         spot: np.ndarray
-            Spot prices of shape (n_days, n_paths)
+            Spot prices of shape (n_days, n_paths, n_hubs)
         """
         rng = np.random.default_rng(seed)
         shocks = rng.standard_normal((self.n_days - 1, n_paths // 2, self.n_factors))
@@ -131,5 +144,10 @@ class PriceModel:
         for t in range(1, self.n_days):
             x[t] = a * x[t - 1] + sigma * shocks[t - 1]
 
-        spot = np.stack([self.spot(t, x[t]) for t in range(self.n_days)])
+        spot = np.stack(
+            [
+                np.stack([self.spot(t, x[t], h) for h in range(self.n_hubs)], axis=-1)
+                for t in range(self.n_days)
+            ]
+        )
         return x, spot

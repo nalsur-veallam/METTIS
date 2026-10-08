@@ -1,7 +1,10 @@
-"""Backward induction for the storage value on a full grid and in tensor train format
+"""Backward induction for storage values on a full grid and in tensor train format
 
-Both solvers keep only the inventory levels Storage.levels(t) at day t. The required
-end level is then part of the state space and needs no penalty.
+The state is the inventory of every storage and the factor values. Both solvers keep
+only the inventory levels Network.levels(t) at day t, so the required end levels are
+part of the state space and need no penalty. Arrays and tensor trains have the
+inventories as their first indices, each counted from the lowest level of its day,
+followed by the factor grid indices.
 """
 
 from functools import reduce
@@ -11,61 +14,72 @@ import teneva
 
 from mettis.operators import cubic_stencil, transition_matrices
 from mettis.prices import PriceModel
-from mettis.storage import Storage
+from mettis.storage import Network, Storage
+
+
+def as_network(asset: Storage | Network) -> Network:
+    return Network.single(asset) if isinstance(asset, Storage) else asset
 
 
 def bellman(
-    storage: Storage, t: int, spot: float | np.ndarray, continuation: np.ndarray
+    network: Network, t: int, spots: list, continuation: np.ndarray
 ) -> np.ndarray:
-    """V(t, I, x) = max_a {a S(x) - cost |a| + C(t, I - a, x)} for all levels I at day t
+    """V(t, I, x) = max over joint actions of {cash + C(t, I - a, x)} for all levels I
 
     Parameters
     ----------
-    storage: Storage
-        Storage contract
+    network: Network
+        Storages and links
     t: int
         Day
-    spot: float | np.ndarray
-        Spot prices, broadcastable to continuation.shape[1:]
+    spots: list
+        Spot prices at each hub, scalars or arrays broadcastable to the factor shape
     continuation: np.ndarray
-        Continuation values C(t, ., x), the first index is the inventory at day t + 1
-        counted from storage.levels(t + 1)[0]
+        C(t, ., x) with the inventories of day t + 1 as first indices
 
     Returns
     -------
     np.ndarray
-        Values V(t, ., x), the first index counted from storage.levels(t)[0]
+        V(t, ., x) with the inventories of day t as first indices
     """
-    low, high = storage.levels(t)
-    next_low, next_high = storage.levels(t + 1)
-    levels = np.arange(low, high + 1)
+    n = network.n_storages
+    levels = [np.arange(low, high + 1) for low, high in network.levels(t)]
+    next_levels = network.levels(t + 1)
 
-    values = np.full((len(levels),) + continuation.shape[1:], -np.inf)
-    for a in storage.actions():
-        next_levels = levels - a
-        allowed = (next_levels >= next_low) & (next_levels <= next_high)
-        if allowed.any():
-            candidate = (
-                storage.cash(a, spot) + continuation[next_levels[allowed] - next_low]
-            )
-            values[allowed] = np.maximum(values[allowed], candidate)
+    shape = tuple(len(level) for level in levels) + continuation.shape[n:]
+    values = np.full(shape, -np.inf)
+    for i, action in enumerate(network.actions):
+        targets, sources = [], []
+        for j in range(n):
+            moved = levels[j] - action[j]
+            low, high = next_levels[j]
+            allowed = (moved >= low) & (moved <= high)
+            targets.append(np.flatnonzero(allowed))
+            sources.append(moved[allowed] - low)
+        if any(len(target) == 0 for target in targets):
+            continue
+        target, source = np.ix_(*targets), np.ix_(*sources)
+        candidate = network.cash(i, spots) + continuation[source]
+        values[target] = np.maximum(values[target], candidate)
     return values
 
 
-def intrinsic_value(storage: Storage, prices: np.ndarray) -> float:
-    """Value of the best fixed schedule for a deterministic price curve"""
-    values = np.zeros(1)
-    for t in reversed(range(storage.n_days)):
-        values = bellman(storage, t, prices[t], storage.discount * values)
-    return float(values[0])
+def intrinsic_value(asset: Storage | Network, prices: np.ndarray) -> float:
+    """Value of the best fixed schedule for deterministic prices of shape (n_hubs, n_days)"""
+    network = as_network(asset)
+    prices = np.atleast_2d(prices)
+    values = np.zeros((1,) * network.n_storages)
+    for t in reversed(range(network.n_days)):
+        values = bellman(network, t, list(prices[:, t]), network.discount * values)
+    return float(values.ravel()[0])
 
 
 class Solution:
     """Value function of a storage problem
 
     For every day t the continuation values C(t, I, x) and the values V(t, I, x) are
-    kept as tensor trains on the grid. The first index is the inventory, counted from
-    the lowest level of day t + 1 for C and of day t for V.
+    kept as tensor trains on the grid. The first indices are the inventories, counted
+    from the lowest levels of day t + 1 for C and of day t for V.
 
     Attributes
     ----------
@@ -73,6 +87,8 @@ class Solution:
         V(0, start, 0)
     grids: list[np.ndarray]
         Factor grids
+    n_storages: int
+        Number of inventory indices in front of the factor indices
     continuation: dict[int, list[np.ndarray]]
         Tensor train of C(t, ., .) for each day t
     values: dict[int, list[np.ndarray]]
@@ -85,12 +101,14 @@ class Solution:
         self,
         value: float,
         grids: list[np.ndarray],
+        n_storages: int,
         continuation: dict,
         values: dict | None = None,
         ranks: list | None = None,
     ) -> None:
         self.value = value
         self.grids = grids
+        self.n_storages = n_storages
         self.continuation = continuation
         self.values = values if values is not None else {}
         self.ranks = ranks if ranks is not None else []
@@ -101,15 +119,27 @@ class Solution:
 
     def continuation_at(self, t: int, x: np.ndarray) -> np.ndarray:
         """C(t, ., x) for factor values x of shape (n_points, n_factors)"""
-        return tt_at_points(self.continuation[t], self.grids, x)
+        return tt_at_points(self.continuation[t], self.grids, x, self.n_storages)
 
     def value_at(self, t: int, x: np.ndarray) -> np.ndarray:
         """V(t, ., x) for factor values x of shape (n_points, n_factors)"""
-        return tt_at_points(self.values[t], self.grids, x)
+        return tt_at_points(self.values[t], self.grids, x, self.n_storages)
+
+
+def spots_on_grid(model: PriceModel, t: int, grids: list[np.ndarray]) -> list:
+    """Spot prices at every hub on the full factor grid"""
+    spots = []
+    for hub in range(model.n_hubs):
+        base, parts = model.spot_on_grid(t, grids, hub)
+        spots.append(base * reduce(np.multiply, np.ix_(*parts)))
+    return spots
 
 
 def solve_grid(
-    model: PriceModel, storage: Storage, grids: list[np.ndarray], keep: bool = True
+    model: PriceModel,
+    asset: Storage | Network,
+    grids: list[np.ndarray],
+    keep: bool = True,
 ) -> Solution:
     """Exact backward induction on the full grid
 
@@ -117,30 +147,30 @@ def solve_grid(
     without compression, so that the exact policy can be simulated with the same code
     as the tensor train policy.
     """
+    network = as_network(asset)
+    n = network.n_storages
     transitions = transition_matrices(model, grids)
-    values = np.zeros((1,) + tuple(len(grid) for grid in grids))
+    values = np.zeros((1,) * n + tuple(len(grid) for grid in grids))
     continuation_trains = {}
 
-    for t in reversed(range(storage.n_days)):
+    for t in reversed(range(network.n_days)):
         continuation = values
         for k, P in enumerate(transitions):
-            continuation = np.tensordot(continuation, P, axes=([k + 1], [1]))
-            continuation = np.moveaxis(continuation, -1, k + 1)
-        continuation = storage.discount * continuation
+            continuation = np.tensordot(continuation, P, axes=([n + k], [1]))
+            continuation = np.moveaxis(continuation, -1, n + k)
+        continuation = network.discount * continuation
         if keep:
             continuation_trains[t] = teneva.svd(continuation, e=1e-12)
+        values = bellman(network, t, spots_on_grid(model, t, grids), continuation)
 
-        base, parts = model.spot_on_grid(t, grids)
-        spot = base * reduce(np.multiply, np.ix_(*parts))
-        values = bellman(storage, t, spot, continuation)
-
-    value = float(values[(0,) + tuple(len(grid) // 2 for grid in grids)])
-    return Solution(value, grids, continuation_trains)
+    center = tuple(len(grid) // 2 for grid in grids)
+    value = float(values[(0,) * n + center])
+    return Solution(value, grids, n, continuation_trains)
 
 
 def solve_tt(
     model: PriceModel,
-    storage: Storage,
+    asset: Storage | Network,
     grids: list[np.ndarray],
     eps: float = 1e-5,
     max_rank: int = 60,
@@ -148,17 +178,18 @@ def solve_tt(
 ) -> Solution:
     """Backward induction with the value function in tensor train format
 
-    The expectation C(t) = discount (I x P_1 x ... x P_d) V(t + 1) is a Kronecker
-    product, so it multiplies every factor core of V(t + 1) by its transition matrix.
-    The maximum over actions is not linear in C(t), so V(t) is rebuilt by TT-cross
-    from values of the Bellman right-hand side and rounded to relative accuracy eps.
+    The expectation C(t) = discount (I x ... x I x P_1 x ... x P_d) V(t + 1) is a
+    Kronecker product, so it multiplies every factor core of V(t + 1) by its transition
+    matrix and leaves the inventory cores alone. The maximum over actions is not linear
+    in C(t), so V(t) is rebuilt by TT-cross from values of the Bellman right-hand side
+    and rounded to relative accuracy eps.
 
     Parameters
     ----------
     model: PriceModel
         Price model
-    storage: Storage
-        Storage contract
+    asset: Storage | Network
+        Storage contract or network of storages and links
     grids: list[np.ndarray]
         Factor grids
     eps: float, default=1e-5
@@ -168,23 +199,32 @@ def solve_tt(
     n_sweeps: int, default=8
         Maximum number of TT-cross sweeps per day
     """
+    network = as_network(asset)
+    n = network.n_storages
     transitions = transition_matrices(model, grids)
-    train = [np.zeros((1, 1, 1))] + [np.ones((1, len(grid), 1)) for grid in grids]
-    solution = Solution(np.nan, grids, continuation={}, values={storage.n_days: train})
 
-    for t in reversed(range(storage.n_days)):
-        continuation = [storage.discount * train[0]] + [
-            np.einsum("ij,ajb->aib", P, core) for P, core in zip(transitions, train[1:])
+    # V(T) = 0 on the single admissible level of every storage
+    train = [np.zeros((1, 1, 1))] + [np.ones((1, 1, 1))] * (n - 1)
+    train += [np.ones((1, len(grid), 1)) for grid in grids]
+    solution = Solution(np.nan, grids, n, {}, values={network.n_days: train})
+
+    for t in reversed(range(network.n_days)):
+        continuation = [network.discount * train[0]] + train[1:n]
+        continuation += [
+            np.einsum("ij,ajb->aib", P, core) for P, core in zip(transitions, train[n:])
         ]
-        bellman_rhs = _bellman_rhs(model, storage, grids, t, continuation)
+        bellman_rhs = _bellman_rhs(model, network, grids, t, continuation)
 
         # Start from V(t + 1) mapped onto the inventory levels of day t
-        low, high = storage.levels(t)
-        next_low, next_high = storage.levels(t + 1)
-        level_index = np.clip(
-            np.arange(low, high + 1) - next_low, 0, next_high - next_low
-        )
-        start = [train[0][:, level_index, :]] + train[1:]
+        start = []
+        for core, (low, high), (next_low, next_high) in zip(
+            train[:n], network.levels(t), network.levels(t + 1)
+        ):
+            index = np.clip(
+                np.arange(low, high + 1) - next_low, 0, next_high - next_low
+            )
+            start.append(core[:, index, :])
+        start += train[n:]
 
         train = teneva.cross(
             bellman_rhs, start, e=eps, nswp=n_sweeps, dr_min=1, dr_max=2
@@ -196,38 +236,40 @@ def solve_tt(
         solution.ranks.append(teneva.ranks(train).tolist())
 
     center = [len(grid) // 2 for grid in grids]
-    solution.value = float(tt_values(train, np.array([[0] + center]))[0])
+    solution.value = float(tt_values(train, np.array([[0] * n + center]))[0])
     return solution
 
 
 def _bellman_rhs(
     model: PriceModel,
-    storage: Storage,
+    network: Network,
     grids: list[np.ndarray],
     t: int,
     continuation: list[np.ndarray],
 ):
     """Bellman right-hand side at day t as a function of grid multi-indices"""
-    low, _ = storage.levels(t)
-    next_low, next_high = storage.levels(t + 1)
-    base, parts = model.spot_on_grid(t, grids)
+    n = network.n_storages
+    lows = np.array([low for low, _ in network.levels(t)])
+    next_lows = np.array([low for low, _ in network.levels(t + 1)])
+    next_highs = np.array([high for _, high in network.levels(t + 1)])
+    spot_factors = [model.spot_on_grid(t, grids, hub) for hub in range(model.n_hubs)]
 
     def rhs(indices: np.ndarray) -> np.ndarray:
         indices = np.asarray(indices, dtype=int)
-        levels = low + indices[:, 0]
-        spot = base * np.prod(
-            [part[indices[:, k + 1]] for k, part in enumerate(parts)], axis=0
-        )
+        levels = lows + indices[:, :n]
+        spots = [
+            base * np.prod([part[indices[:, n + k]] for k, part in enumerate(parts)], 0)
+            for base, parts in spot_factors
+        ]
         result = np.full(len(indices), -np.inf)
-        for a in storage.actions():
-            next_levels = levels - a
-            allowed = (next_levels >= next_low) & (next_levels <= next_high)
+        for i, action in enumerate(network.actions):
+            moved = levels - action
+            allowed = np.all((moved >= next_lows) & (moved <= next_highs), axis=1)
             if allowed.any():
                 next_indices = indices[allowed].copy()
-                next_indices[:, 0] = next_levels[allowed] - next_low
-                candidate = storage.cash(a, spot[allowed]) + tt_values(
-                    continuation, next_indices
-                )
+                next_indices[:, :n] = moved[allowed] - next_lows
+                cash = network.cash(i, [spot[allowed] for spot in spots])
+                candidate = cash + tt_values(continuation, next_indices)
                 result[allowed] = np.maximum(result[allowed], candidate)
         return result
 
@@ -247,26 +289,35 @@ def tt_values(cores: list[np.ndarray], indices: np.ndarray, chunk: int = 20_000)
 
 
 def tt_at_points(
-    cores: list[np.ndarray], grids: list[np.ndarray], x: np.ndarray, chunk: int = 2_000
+    cores: list[np.ndarray],
+    grids: list[np.ndarray],
+    x: np.ndarray,
+    n_storages: int = 1,
+    chunk: int = 2_000,
 ) -> np.ndarray:
-    """Tensor train with the inventory as first index at continuous factor values
+    """Tensor train at continuous factor values, for all inventory levels
 
-    Cubic interpolation weights of each factor are applied to its core, then the cores
-    are multiplied.
+    The inventory cores are multiplied once. Cubic interpolation weights of each
+    factor are applied to its core, then the factor cores are multiplied.
 
     Returns
     -------
     np.ndarray
-        Values of shape (n_points, n_levels)
+        Values of shape (n_points, n_levels_1, ..., n_levels_K)
     """
+    inventory = cores[0][0]
+    for core in cores[1:n_storages]:
+        inventory = np.tensordot(inventory, core, axes=([-1], [0]))
+
     result = []
     for i in range(0, len(x), chunk):
         product = None
         for k, grid in enumerate(grids):
             indices, weights = cubic_stencil(grid, x[i : i + chunk, k])
-            core = np.einsum("mj,rmjs->mrs", weights, cores[k + 1][:, indices, :])
+            core = cores[n_storages + k][:, indices, :]
+            core = np.einsum("mj,rmjs->mrs", weights, core)
             product = core if product is None else product @ core
-        result.append(product[:, :, 0] @ cores[0][0].T)
+        result.append(np.einsum("...r,mr->m...", inventory, product[:, :, 0]))
     return np.concatenate(result)
 
 
